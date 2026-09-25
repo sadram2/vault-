@@ -1,43 +1,564 @@
-# Vault Helm Chart
+# Vault Helm Chart with Automatic Unseal
 
-> :warning: **Please note**: We take Vault's security and our users' trust very seriously. If 
-you believe you have found a security issue in Vault Helm, _please responsibly disclose_ 
-by contacting us at [security@hashicorp.com](mailto:security@hashicorp.com).
+This repository contains the Helm configuration required to deploy HashiCorp Vault on Kubernetes with an additional **Vault Unseal Sidecar Container**.
 
-This repository contains the official HashiCorp Helm chart for installing
-and configuring Vault on Kubernetes. This chart supports multiple use
-cases of Vault on Kubernetes depending on the values provided.
+The sidecar container is responsible for automatically unsealing Vault after the Vault Pod starts.
 
-For full documentation on this Helm chart along with all the ways you can
-use Vault with Kubernetes, please see the
-[Vault and Kubernetes documentation](https://developer.hashicorp.com/vault/docs/platform/k8s).
+## Architecture
 
-## Prerequisites
+Each Vault Pod contains two containers:
 
-To use the charts here, [Helm](https://helm.sh/) must be configured for your
-Kubernetes cluster. Setting up Kubernetes and Helm is outside the scope of
-this README. Please refer to the Kubernetes and Helm documentation.
+* **Vault container** — runs the Vault server.
+* **vault-unseal-agent** — waits for Vault to become available and automatically performs the unseal operation using the stored unseal keys.
 
-The versions required are:
+The unseal keys are stored in a Kubernetes `Secret`, while the unseal script is stored in a Kubernetes `ConfigMap`.
 
-  * **Helm 3.6+**
-  * **Kubernetes 1.29+** - This is the earliest version of Kubernetes tested.
-    It is possible that this chart works with earlier versions but it is
-    untested.
-
-## Usage
-
-To install the latest version of this chart, add the Hashicorp helm repository
-and run `helm install`:
-
-```console
-$ helm repo add hashicorp https://helm.releases.hashicorp.com
-"hashicorp" has been added to your repositories
-
-$ helm install vault hashicorp/vault
+```text
+                    Vault Pod
+┌──────────────────────────────────────────────────────┐
+│                                                      │
+│  ┌──────────────────────┐                            │
+│  │     Vault Container  │                            │
+│  │                      │                            │
+│  │     Vault Server     │                            │
+│  └──────────┬───────────┘                            │
+│             │                                        │
+│             │ Vault API                               │
+│             │                                        │
+│  ┌──────────▼───────────┐                            │
+│  │  vault-unseal-agent  │                            │
+│  │                      │                            │
+│  │    unseal.sh         │                            │
+│  └──────────┬───────────┘                            │
+│             │                                        │
+│       ┌─────┴──────┐                                 │
+│       │            │                                 │
+│       ▼            ▼                                 │
+│  Secret Volume  ConfigMap Volume                    │
+│  unseal keys    unseal script                       │
+│                                                      │
+└──────────────────────────────────────────────────────┘
 ```
 
-Please see the many options supported in the `values.yaml` file. These are also
-fully documented directly on the [Vault
-website](https://developer.hashicorp.com/vault/docs/platform/k8s/helm) along with more
-detailed installation instructions.
+---
+
+# 1. Prerequisites
+
+Before installing Vault, make sure the following are available:
+
+* Kubernetes cluster
+* Helm 3
+* Access to the Kubernetes cluster
+* Access to the HashiCorp Helm repository
+
+Add the HashiCorp Helm repository:
+
+```bash
+helm repo add hashicorp https://helm.releases.hashicorp.com
+helm repo update
+```
+
+Verify the repository:
+
+```bash
+helm repo list
+```
+
+---
+
+# 2. Configure the Vault Unseal Sidecar
+
+The Vault Helm chart is configured using `values.yaml`.
+
+Add the following `extraContainers` configuration:
+
+```yaml
+extraContainers:
+  - name: vault-unseal-agent
+    image: docker.tapsifood.cloud/library/hashicorp/vault:1.15.2
+    imagePullPolicy: IfNotPresent
+
+    command:
+      - /bin/sh
+      - /vault/userconfig/unseal-script/unseal.sh
+
+    volumeMounts:
+      - name: vault-unseal-keys
+        mountPath: /vault/unseal-keys
+        readOnly: true
+
+      - name: vault-unseal-script
+        mountPath: /vault/userconfig/unseal-script
+        readOnly: true
+```
+
+This configuration adds a second container called `vault-unseal-agent` to every Vault Pod.
+
+The container starts the following script:
+
+```text
+/vault/userconfig/unseal-script/unseal.sh
+```
+
+The script is provided through a Kubernetes `ConfigMap`.
+
+The unseal keys are provided through a Kubernetes `Secret`.
+
+---
+
+# 3. Configure the Volumes
+
+The sidecar needs access to two volumes:
+
+1. `vault-unseal-keys` → Kubernetes Secret containing the Vault unseal keys.
+2. `vault-unseal-script` → Kubernetes ConfigMap containing the unseal script.
+
+Add the following to `values.yaml`:
+
+```yaml
+volumes:
+
+  - name: vault-unseal-keys
+    secret:
+      secretName: vault-unseal-keys
+
+  - name: vault-unseal-script
+    configMap:
+      name: vault-unseal-script
+```
+
+The complete configuration therefore looks similar to:
+
+```yaml
+extraContainers:
+  - name: vault-unseal-agent
+    image: docker.tapsifood.cloud/library/hashicorp/vault:1.15.2
+    imagePullPolicy: IfNotPresent
+
+    command:
+      - /bin/sh
+      - /vault/userconfig/unseal-script/unseal.sh
+
+    volumeMounts:
+      - name: vault-unseal-keys
+        mountPath: /vault/unseal-keys
+        readOnly: true
+
+      - name: vault-unseal-script
+        mountPath: /vault/userconfig/unseal-script
+        readOnly: true
+
+volumes:
+
+  - name: vault-unseal-keys
+    secret:
+      secretName: vault-unseal-keys
+
+  - name: vault-unseal-script
+    configMap:
+      name: vault-unseal-script
+```
+
+> **Important:** Do not enable the `vault-unseal-keys` volume during the first Vault installation. The Secret does not exist yet because the unseal keys are generated by Vault during initialization.
+
+---
+
+# 4. Create the Unseal Script ConfigMap
+
+The unseal script must be available inside the sidecar container.
+
+Create a file called:
+
+```text
+unseal.sh
+```
+
+The script is mounted into the container through the `vault-unseal-script` ConfigMap.
+
+Create the ConfigMap manually:
+
+```bash
+kubectl create configmap vault-unseal-script \
+  --from-file=unseal.sh=unseal.sh \
+  -n vault
+```
+
+Verify it:
+
+```bash
+kubectl get configmap vault-unseal-script -n vault
+```
+
+You can also inspect its content:
+
+```bash
+kubectl get configmap vault-unseal-script -n vault -o yaml
+```
+
+The ConfigMap provides the following file inside the sidecar:
+
+```text
+/vault/userconfig/unseal-script/unseal.sh
+```
+
+---
+
+# 5. First Vault Installation
+
+During the first installation, Vault has not been initialized yet.
+
+Therefore, the unseal keys do not exist.
+
+For the first installation:
+
+* Keep `extraContainers` disabled.
+* Keep the `vault-unseal-keys` volume disabled.
+* Install Vault normally.
+
+For example:
+
+```bash
+helm install vault hashicorp/vault \
+  -n vault \
+  --create-namespace \
+  -f values.yaml
+```
+
+Check the Pods:
+
+```bash
+kubectl get pods -n vault
+```
+
+Wait until Vault is running.
+
+---
+
+# 6. Initialize Vault
+
+After Vault is running, initialize it for the first time.
+
+Enter the Vault Pod:
+
+```bash
+kubectl exec -it vault-0 -n vault -- sh
+```
+
+Check the Vault status:
+
+```bash
+vault status
+```
+
+Vault should report that it is not initialized and is sealed.
+
+Initialize Vault:
+
+```bash
+vault operator init
+```
+
+The command generates:
+
+* Unseal Keys
+* Initial Root Token
+
+Example:
+
+```text
+Unseal Key 1: xxxxxxxxxxxxxxxxx
+Unseal Key 2: xxxxxxxxxxxxxxxxx
+Unseal Key 3: xxxxxxxxxxxxxxxxx
+Unseal Key 4: xxxxxxxxxxxxxxxxx
+Unseal Key 5: xxxxxxxxxxxxxxxxx
+
+Initial Root Token: hvs.xxxxxxxxxxxxxxxxx
+```
+
+## Important
+
+**Save the generated Unseal Keys and Root Token securely.**
+
+Do not commit them to GitLab or store them inside `values.yaml`.
+
+---
+
+# 7. Create the Unseal Keys Secret
+
+After initializing Vault, create a Kubernetes Secret containing the required unseal keys.
+
+For example:
+
+```bash
+kubectl create secret generic vault-unseal-keys \
+  -n vault \
+  --from-literal=key1='<UNSEAL_KEY_1>' \
+  --from-literal=key2='<UNSEAL_KEY_2>' \
+  --from-literal=key3='<UNSEAL_KEY_3>' \
+  --from-literal=key4='<UNSEAL_KEY_4>' \
+  --from-literal=key5='<UNSEAL_KEY_5>'
+```
+
+Verify the Secret:
+
+```bash
+kubectl get secret vault-unseal-keys -n vault
+```
+
+> **Security:** Kubernetes Secrets are not automatically equivalent to a secure external secret manager. Make sure Kubernetes Secret encryption at rest and appropriate RBAC are configured for your cluster.
+
+---
+
+# 8. Enable the Unseal Sidecar
+
+Now that the `vault-unseal-keys` Secret exists, enable the sidecar configuration in `values.yaml`.
+
+Make sure the following sections are enabled:
+
+```yaml
+extraContainers:
+  - name: vault-unseal-agent
+    image: docker.tapsifood.cloud/library/hashicorp/vault:1.15.2
+    imagePullPolicy: IfNotPresent
+
+    command:
+      - /bin/sh
+      - /vault/userconfig/unseal-script/unseal.sh
+
+    volumeMounts:
+      - name: vault-unseal-keys
+        mountPath: /vault/unseal-keys
+        readOnly: true
+
+      - name: vault-unseal-script
+        mountPath: /vault/userconfig/unseal-script
+        readOnly: true
+
+volumes:
+
+  - name: vault-unseal-keys
+    secret:
+      secretName: vault-unseal-keys
+
+  - name: vault-unseal-script
+    configMap:
+      name: vault-unseal-script
+```
+
+---
+
+# 9. Upgrade the Vault Helm Release
+
+Apply the new configuration using:
+
+```bash
+helm upgrade vault hashicorp/vault \
+  -n vault \
+  -f values.yaml
+```
+
+Check the Pods:
+
+```bash
+kubectl get pods -n vault
+```
+
+The Vault Pod should now contain two containers:
+
+```text
+vault-0
+├── vault
+└── vault-unseal-agent
+```
+
+Check the containers:
+
+```bash
+kubectl get pod vault-0 -n vault \
+  -o jsonpath='{.spec.containers[*].name}'
+```
+
+Expected output:
+
+```text
+vault vault-unseal-agent
+```
+
+---
+
+# 10. Verify Automatic Unseal
+
+Check the Vault status:
+
+```bash
+kubectl exec -it vault-0 -n vault -c vault -- vault status
+```
+
+The expected result should show:
+
+```text
+Initialized    true
+Sealed         false
+```
+
+You can also check the sidecar logs:
+
+```bash
+kubectl logs vault-0 \
+  -n vault \
+  -c vault-unseal-agent
+```
+
+The logs should show that the sidecar detected the Vault state and performed the unseal operation.
+
+---
+
+# 11. Test the Automatic Unseal
+
+To verify that the configuration works correctly, restart the Vault Pod:
+
+```bash
+kubectl delete pod vault-0 -n vault
+```
+
+Kubernetes will recreate the Pod.
+
+Watch the Pod:
+
+```bash
+kubectl get pods -n vault -w
+```
+
+After the Pod starts, check Vault:
+
+```bash
+kubectl exec -it vault-0 \
+  -n vault \
+  -c vault \
+  -- vault status
+```
+
+The Vault should automatically transition from:
+
+```text
+Sealed: true
+```
+
+to:
+
+```text
+Sealed: false
+```
+
+without manually running:
+
+```bash
+vault operator unseal
+```
+
+---
+
+# 12. Troubleshooting
+
+## Check Vault container logs
+
+```bash
+kubectl logs vault-0 \
+  -n vault \
+  -c vault
+```
+
+## Check unseal sidecar logs
+
+```bash
+kubectl logs vault-0 \
+  -n vault \
+  -c vault-unseal-agent
+```
+
+## Check the Secret
+
+```bash
+kubectl get secret vault-unseal-keys -n vault
+```
+
+## Check the ConfigMap
+
+```bash
+kubectl get configmap vault-unseal-script -n vault
+```
+
+## Check mounted files
+
+```bash
+kubectl exec -it vault-0 \
+  -n vault \
+  -c vault-unseal-agent \
+  -- ls -la /vault/unseal-keys
+```
+
+Check the script:
+
+```bash
+kubectl exec -it vault-0 \
+  -n vault \
+  -c vault-unseal-agent \
+  -- ls -la /vault/userconfig/unseal-script
+```
+
+---
+
+# Installation Flow
+
+The complete installation process is:
+
+```text
+1. Configure values.yaml
+          │
+          ▼
+2. Create vault-unseal-script ConfigMap
+          │
+          ▼
+3. Install Vault for the first time
+   (without unseal Secret/volume)
+          │
+          ▼
+4. Run vault operator init
+          │
+          ▼
+5. Receive Unseal Keys + Root Token
+          │
+          ▼
+6. Create vault-unseal-keys Secret
+          │
+          ▼
+7. Enable extraContainer + volumes
+          │
+          ▼
+8. helm upgrade
+          │
+          ▼
+9. Vault Pod starts with sidecar
+          │
+          ▼
+10. Sidecar reads Unseal Keys
+          │
+          ▼
+11. Sidecar automatically unseals Vault
+```
+
+## Important Security Considerations
+
+The Unseal Keys provide direct access to the Vault unseal mechanism.
+
+Therefore:
+
+* Never commit Unseal Keys to Git.
+* Never commit the Root Token to Git.
+* Do not put Unseal Keys directly into `values.yaml`.
+* Restrict access to the `vault-unseal-keys` Kubernetes Secret.
+* Enable Kubernetes Secret encryption at rest.
+* Use RBAC to limit who can read the Secret.
+* Consider using Vault Auto Unseal with a KMS/HSM or another supported seal mechanism for production environments.
+
+This sidecar-based approach is useful when an external KMS/HSM based auto-unseal mechanism is not available, but storing long-lived unseal keys inside Kubernetes introduces additional security considerations.
